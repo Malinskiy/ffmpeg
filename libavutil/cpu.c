@@ -38,7 +38,11 @@
 #include <sys/param.h>
 #endif
 #include <sys/types.h>
+#ifdef ANDROID
+#include <linux/sysctl.h>
+#else
 #include <sys/sysctl.h>
+#endif
 #endif
 #if HAVE_SYSCONF
 #include <unistd.h>
