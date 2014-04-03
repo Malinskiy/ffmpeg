@@ -1,37 +1,41 @@
 /*
- * Interface to the Android Stagefright library for
- * H/W accelerated H.264 decoding
- *
- * Copyright (C) 2011 Mohamed Naufal
- * Copyright (C) 2011 Martin Storsjö
- *
- * This file is part of FFmpeg.
- *
- * FFmpeg is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or (at your option) any later version.
- *
- * FFmpeg is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public
- * License along with FFmpeg; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
- */
+* Interface to the Android Stagefright library for
+* H/W accelerated H.264 decoding
+*
+* Copyright (C) 2011 Mohamed Naufal
+* Copyright (C) 2011 Martin Storsjö
+*
+* This file is part of FFmpeg.
+*
+* FFmpeg is free software; you can redistribute it and/or
+* modify it under the terms of the GNU Lesser General Public
+* License as published by the Free Software Foundation; either
+* version 2.1 of the License, or (at your option) any later version.
+*
+* FFmpeg is distributed in the hope that it will be useful,
+* but WITHOUT ANY WARRANTY; without even the implied warranty of
+* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+* Lesser General Public License for more details.
+*
+* You should have received a copy of the GNU Lesser General Public
+* License along with FFmpeg; if not, write to the Free Software
+* Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+*/
 
 #include <binder/ProcessState.h>
+#include <media/stagefright/MediaErrors.h>
 #include <media/stagefright/MetaData.h>
 #include <media/stagefright/MediaBufferGroup.h>
 #include <media/stagefright/MediaDebug.h>
 #include <media/stagefright/MediaDefs.h>
 #include <media/stagefright/OMXClient.h>
 #include <media/stagefright/OMXCodec.h>
-#include <utils/List.h>
+#include <media/stagefright/openmax/OMX_IVCommon.h>
 #include <new>
 #include <map>
+#include <list>
+
+#include <android/log.h>
 
 extern "C" {
 #include "avcodec.h"
@@ -39,18 +43,37 @@ extern "C" {
 #include "internal.h"
 }
 
-#define OMX_QCOM_COLOR_FormatYVU420SemiPlanar 0x7FA30C00
-
 using namespace android;
 
 struct Frame {
-    status_t status;
-    size_t size;
-    int64_t time;
-    int key;
+    int64_t frameTime;
+    int isKeyFrame;
+    AVFrame *ffmpegFrame;
     uint8_t *buffer;
-    AVFrame *vframe;
+    size_t bufferSize;
 };
+
+static void freeFrame(Frame* frame, bool retainAVFrame) {
+    if(frame == NULL) return;
+    if(frame->ffmpegFrame && !retainAVFrame) av_frame_free(&(frame->ffmpegFrame));
+    if(frame->buffer) av_freep(&(frame->buffer));;
+    av_freep(&frame);
+}
+
+static Frame* allocFrame(int bufferSize) {
+    Frame* newFrame = (Frame*)av_mallocz(sizeof(Frame));
+    if(newFrame == NULL) return NULL;
+
+    newFrame->ffmpegFrame = NULL;
+    newFrame->buffer = bufferSize > 0 ? (uint8_t*)av_malloc(bufferSize) : NULL;
+    if(bufferSize > 0 && newFrame->buffer == NULL) {
+        freeFrame(newFrame, false);
+        return NULL;
+    }
+    newFrame->bufferSize = bufferSize;
+    return newFrame;
+
+}
 
 struct TimeStamp {
     int64_t pts;
@@ -60,43 +83,41 @@ struct TimeStamp {
 class CustomSource;
 
 struct StagefrightContext {
-    AVCodecContext *avctx;
-    AVBitStreamFilterContext *bsfc;
-    uint8_t* orig_extradata;
-    int orig_extradata_size;
-    sp<MediaSource> *source;
-    List<Frame*> *in_queue, *out_queue;
-    pthread_mutex_t in_mutex, out_mutex;
-    pthread_cond_t condition;
-    pthread_t decode_thread_id;
+    AVCodecContext *mVideo;
+    AVBitStreamFilterContext *mConverter;
+    uint8_t* frameExtraData;
+    int frameExtraDataSize;
+    std::list<Frame*> *inputFrameQueue, *outputFrameQueue;
 
-    Frame *end_frame;
+    pthread_mutex_t inputQueueMutex, outputQueueMutex;
+    pthread_cond_t frameAvailableCondition;
+    pthread_t decoderThreadId;
+    volatile sig_atomic_t decoderThreadStarted, decoderThreadExited, stopDecoderThread, stopReadThread;
+
+    int64_t currentFrameIndex;
+    std::map<int64_t, TimeStamp> *frameIndexToTimestampMap;
+
+    OMXClient *omxClient;
+    bool isOmxConnected;
+    sp<MediaSource> mediaSource;
+    sp<MediaSource> decoder;
+    sp<MetaData> decoderOutputFormat;
+    const char *decoderName;
+
     bool source_done;
-    volatile sig_atomic_t thread_started, thread_exited, stop_decode;
-
-    AVFrame *prev_frame;
-    std::map<int64_t, TimeStamp> *ts_map;
-    int64_t frame_index;
-
-    uint8_t *dummy_buf;
-    int dummy_bufsize;
-
-    OMXClient *client;
-    sp<MediaSource> *decoder;
-    const char *decoder_component;
 };
 
 class CustomSource : public MediaSource {
 public:
-    CustomSource(AVCodecContext *avctx, sp<MetaData> meta) {
-        s = (StagefrightContext*)avctx->priv_data;
-        source_meta = meta;
-        frame_size  = (avctx->width * avctx->height * 3) / 2;
-        buf_group.add_buffer(new MediaBuffer(frame_size));
+    CustomSource(AVCodecContext *avctx, sp<MetaData> meta) : MediaSource() {
+        stageFrightContext = (StagefrightContext*)avctx->priv_data;
+        sourceMetaData = meta;
+        frameSize  = (avctx->width * avctx->height * 3) / 2;
+        bufferGroup.add_buffer(new MediaBuffer(frameSize));
     }
 
     virtual sp<MetaData> getFormat() {
-        return source_meta;
+        return sourceMetaData;
     }
 
     virtual status_t start(MetaData *params) {
@@ -107,458 +128,647 @@ public:
         return OK;
     }
 
-    virtual status_t read(MediaBuffer **buffer,
-                          const MediaSource::ReadOptions *options) {
-        Frame *frame;
+    virtual status_t read(MediaBuffer **buffer, const MediaSource::ReadOptions *options) {
         status_t ret;
 
-        if (s->thread_exited)
-            return ERROR_END_OF_STREAM;
-        pthread_mutex_lock(&s->in_mutex);
-
-        while (s->in_queue->empty())
-            pthread_cond_wait(&s->condition, &s->in_mutex);
-
-        frame = *s->in_queue->begin();
-        ret = frame->status;
-
-        if (ret == OK) {
-            ret = buf_group.acquire_buffer(buffer);
-            if (ret == OK) {
-                memcpy((*buffer)->data(), frame->buffer, frame->size);
-                (*buffer)->set_range(0, frame->size);
-                (*buffer)->meta_data()->clear();
-                (*buffer)->meta_data()->setInt32(kKeyIsSyncFrame,frame->key);
-                (*buffer)->meta_data()->setInt64(kKeyTime, frame->time);
-            } else {
-                av_log(s->avctx, AV_LOG_ERROR, "Failed to acquire MediaBuffer\n");
+        //av_log(NULL, AV_LOG_DEBUG, "CustomSource::read\n");
+        //for (;;) {
+        while (stageFrightContext->inputFrameQueue->empty()) {
+            if (stageFrightContext->stopReadThread) {
+                //av_log(NULL, AV_LOG_DEBUG, "CustomSource::read: thread exiting\n");
+                stageFrightContext->stopReadThread = true;
+                return ERROR_END_OF_STREAM;
             }
-            av_freep(&frame->buffer);
+            //av_log(NULL, AV_LOG_DEBUG, "CustomSource::read locking input queue\n");
+            pthread_mutex_lock(&stageFrightContext->inputQueueMutex);
+            //av_log(NULL, AV_LOG_DEBUG, "CustomSource::read waiting for frameAvailableCondition\n");
+            pthread_cond_wait(&stageFrightContext->frameAvailableCondition, &stageFrightContext->inputQueueMutex);
         }
 
-        s->in_queue->erase(s->in_queue->begin());
-        pthread_mutex_unlock(&s->in_mutex);
+        Frame *frame = *stageFrightContext->inputFrameQueue->begin();
 
-        av_freep(&frame);
-        return ret;
+        //av_log(NULL, AV_LOG_DEBUG, "CustomSource::read: got frame from input queue of %d\n", frame->bufferSize);
+
+        ret = bufferGroup.acquire_buffer(buffer);
+        if (ret == OK) {
+            memcpy((uint8_t *)(*buffer)->data() + (*buffer)->range_offset(), frame->buffer, frame->bufferSize);
+            (*buffer)->set_range(0, frame->bufferSize);
+            (*buffer)->meta_data()->clear();
+            (*buffer)->meta_data()->setInt32(kKeyIsSyncFrame, frame->isKeyFrame);
+            (*buffer)->meta_data()->setInt64(kKeyTime, frame->frameTime);
+        } else {
+            av_log(NULL, AV_LOG_ERROR, "Failed to acquire MediaBuffer\n");
+        }
+
+        stageFrightContext->inputFrameQueue->remove(frame);
+        //av_log(NULL, AV_LOG_DEBUG, "CustomSource::read freeFrame\n");
+        freeFrame(frame, false);
+        pthread_mutex_unlock(&stageFrightContext->inputQueueMutex);
+
+        //av_log(NULL, AV_LOG_DEBUG, "CustomSource::read returning OK\n");
+        return OK;
+        //}
     }
 
 private:
-    MediaBufferGroup buf_group;
-    sp<MetaData> source_meta;
-    StagefrightContext *s;
-    int frame_size;
+    MediaBufferGroup bufferGroup;
+    sp<MetaData> sourceMetaData;
+    StagefrightContext *stageFrightContext;
+    int frameSize;
 };
 
-void* decode_thread(void *arg)
+static void pgm_save(unsigned char *buf, int wrap, int xsize, int ysize, char *filename)
+{
+    FILE *f;
+    int i;
+    f = fopen(filename,"w");
+    fprintf(f, "P5\n%d %d\n%d\n", xsize, ysize, 255);
+    for (i = 0; i < ysize; i++)
+        fwrite(buf + i * wrap, 1, xsize, f);
+    fclose(f);
+}
+
+void* decoderThread(void *arg)
 {
     AVCodecContext *avctx = (AVCodecContext*)arg;
-    StagefrightContext *s = (StagefrightContext*)avctx->priv_data;
-    const AVPixFmtDescriptor *pix_desc = av_pix_fmt_desc_get(avctx->pix_fmt);
+    StagefrightContext *stagefrightContext = (StagefrightContext*)avctx->priv_data;
+    const AVPixFmtDescriptor *pixelDescriptor = av_pix_fmt_desc_get(avctx->pix_fmt);
     Frame* frame;
-    MediaBuffer *buffer;
-    int32_t w, h;
-    int decode_done = 0;
-    int ret;
-    int src_linesize[3];
-    const uint8_t *src_data[3];
-    int64_t out_frame_index = 0;
+    MediaBuffer *mediaBuffer;
+    int32_t width, height;
+    int status;
+    int imageLinesize[3];
+    const uint8_t *imageData[3];
+    int64_t frameTimestamp = 0;
 
     do {
-        buffer = NULL;
-        frame = (Frame*)av_mallocz(sizeof(Frame));
-        if (!frame) {
-            frame         = s->end_frame;
-            frame->status = AVERROR(ENOMEM);
-            decode_done   = 1;
-            s->end_frame  = NULL;
-            goto push_frame;
-        }
-        frame->status = (*s->decoder)->read(&buffer);
-        if (frame->status == OK) {
-            sp<MetaData> outFormat = (*s->decoder)->getFormat();
-            outFormat->findInt32(kKeyWidth , &w);
-            outFormat->findInt32(kKeyHeight, &h);
-            frame->vframe = av_frame_alloc();
-            if (!frame->vframe) {
-                frame->status = AVERROR(ENOMEM);
-                decode_done   = 1;
-                buffer->release();
-                goto push_frame;
+        mediaBuffer = NULL;
+        frame = NULL;
+
+        //av_log(avctx, AV_LOG_DEBUG, "decoderThread: Pushing buffer to decoder\n");
+        status = stagefrightContext->decoder->read(&mediaBuffer);
+
+        //av_log(avctx, AV_LOG_DEBUG, "decoderThread: Decoder read returned %d\n", status);
+        switch(status) {
+        case OK: {
+            sp<MetaData> imageFormat = stagefrightContext->decoder->getFormat();
+            imageFormat->findInt32(kKeyWidth , &width);
+            imageFormat->findInt32(kKeyHeight, &height);
+            //av_log(avctx, AV_LOG_DEBUG, "decoderThread: Output format is %d x %d\n", width, height);
+
+            frame = allocFrame(0);
+            if (!frame) {
+                av_log(avctx, AV_LOG_ERROR, "decoderThread: Can't allocate frame in decoder thread\n");
+                break;
             }
-            ret = ff_get_buffer(avctx, frame->vframe, AV_GET_BUFFER_FLAG_REF);
-            if (ret < 0) {
-                frame->status = ret;
-                decode_done   = 1;
-                buffer->release();
-                goto push_frame;
+            frame->ffmpegFrame = av_frame_alloc();
+            if(frame->ffmpegFrame == NULL) {
+                av_log(avctx, AV_LOG_ERROR, "decoderThread: Can't allocate AVFrame in decoder thread\n");
+                freeFrame(frame, false);
+                break;
             }
 
             // The OMX.SEC decoder doesn't signal the modified width/height
-            if (s->decoder_component && !strncmp(s->decoder_component, "OMX.SEC", 7) &&
-                (w & 15 || h & 15)) {
-                if (((w + 15)&~15) * ((h + 15)&~15) * 3/2 == buffer->range_length()) {
-                    w = (w + 15)&~15;
-                    h = (h + 15)&~15;
+            if (stagefrightContext->decoderName                             &&
+                    !strncmp(stagefrightContext->decoderName, "OMX.SEC", 7) &&
+                    (width & 15 || height & 15)                             &&
+                    ((width + 15)&~15) * ((height + 15)&~15) * 3/2 == mediaBuffer->range_length()) {
+
+                width = (width + 15)&~15;
+                height = (height + 15)&~15;
+            }
+
+            if (!avctx->width || !avctx->height || avctx->width > width || avctx->height > height) {
+                avctx->width  = width;
+                avctx->height = height;
+            }
+
+            if(avpicture_fill((AVPicture *)(frame->ffmpegFrame), (uint8_t*)mediaBuffer->data(), avctx->pix_fmt, width, height) < 0) {
+                av_log(avctx, AV_LOG_ERROR, "decoderThread: Can't do avpicture_fill\n");
+                freeFrame(frame, false);
+                break;
+            }
+
+            frame->ffmpegFrame->format = avctx->pix_fmt;
+            frame->ffmpegFrame->height = height;
+            frame->ffmpegFrame->width = width;
+            frame->ffmpegFrame->channel_layout = 0;
+
+//            V/ffmpeg  (10410): ret_frame: format -1
+//            V/ffmpeg  (10410): ret_frame: 0 x 0
+//            V/ffmpeg  (10410): ret_frame: channels 0
+//            V/ffmpeg  (10410): ret_frame: channel_layout 0
+//            V/ffmpeg  (10410): ret_frame: format -1
+//            V/ffmpeg  (10410): ret_frame: nb_samples 0
+
+            //pgm_save(frame->ffmpegFrame->data[0], frame->ffmpegFrame->linesize[0], width, height, "/sdcard/decoded.pgm");
+
+            //av_log(avctx, AV_LOG_DEBUG, "decoderThread: Hurry up into the output :-)\n");
+            if (mediaBuffer->meta_data()->findInt64(kKeyTime, &frameTimestamp) &&
+                    stagefrightContext->frameIndexToTimestampMap->count(frameTimestamp) > 0) {
+
+                //av_log(avctx, AV_LOG_DEBUG, "decoderThread: writing pts\n");
+                frame->ffmpegFrame->pts = (*(stagefrightContext->frameIndexToTimestampMap))[frameTimestamp].pts;
+                //av_log(avctx, AV_LOG_DEBUG, "decoderThread: writing reorder opaque\n");
+                frame->ffmpegFrame->reordered_opaque = (*stagefrightContext->frameIndexToTimestampMap)[frameTimestamp].reordered_opaque;
+                //av_log(avctx, AV_LOG_DEBUG, "decoderThread: erasing timestamp from map\n");
+                stagefrightContext->frameIndexToTimestampMap->erase(frameTimestamp);
+            }
+
+            //av_log(avctx, AV_LOG_DEBUG, "decoderThread: Waiting for a slot in the output\n");
+            while (true) {
+                pthread_mutex_lock(&stagefrightContext->outputQueueMutex);
+                if (stagefrightContext->outputFrameQueue->size() >= 10) {
+                    pthread_mutex_unlock(&stagefrightContext->outputQueueMutex);
+                    usleep(10000);
+                    continue;
                 }
+                break;
             }
-
-            if (!avctx->width || !avctx->height || avctx->width > w || avctx->height > h) {
-                avctx->width  = w;
-                avctx->height = h;
-            }
-
-            src_linesize[0] = av_image_get_linesize(avctx->pix_fmt, w, 0);
-            src_linesize[1] = av_image_get_linesize(avctx->pix_fmt, w, 1);
-            src_linesize[2] = av_image_get_linesize(avctx->pix_fmt, w, 2);
-
-            src_data[0] = (uint8_t*)buffer->data();
-            src_data[1] = src_data[0] + src_linesize[0] * h;
-            src_data[2] = src_data[1] + src_linesize[1] * -(-h>>pix_desc->log2_chroma_h);
-            av_image_copy(frame->vframe->data, frame->vframe->linesize,
-                          src_data, src_linesize,
-                          avctx->pix_fmt, avctx->width, avctx->height);
-
-            buffer->meta_data()->findInt64(kKeyTime, &out_frame_index);
-            if (out_frame_index && s->ts_map->count(out_frame_index) > 0) {
-                frame->vframe->pts = (*s->ts_map)[out_frame_index].pts;
-                frame->vframe->reordered_opaque = (*s->ts_map)[out_frame_index].reordered_opaque;
-                s->ts_map->erase(out_frame_index);
-            }
-            buffer->release();
-            } else if (frame->status == INFO_FORMAT_CHANGED) {
-                if (buffer)
-                    buffer->release();
-                av_free(frame);
-                continue;
-            } else {
-                decode_done = 1;
-            }
-push_frame:
-        while (true) {
-            pthread_mutex_lock(&s->out_mutex);
-            if (s->out_queue->size() >= 10) {
-                pthread_mutex_unlock(&s->out_mutex);
-                usleep(10000);
-                continue;
-            }
+            //av_log(avctx, AV_LOG_DEBUG, "decoderThread: pushing frame to output queue\n");
+            stagefrightContext->outputFrameQueue->push_back(frame);
+            pthread_mutex_unlock(&stagefrightContext->outputQueueMutex);
+            //av_log(avctx, AV_LOG_DEBUG, "decoderThread: Pushed decoded frame to output queue\n");
+            mediaBuffer->release();
             break;
         }
-        s->out_queue->push_back(frame);
-        pthread_mutex_unlock(&s->out_mutex);
-    } while (!decode_done && !s->stop_decode);
-
-    s->thread_exited = true;
-
+        case INFO_FORMAT_CHANGED:
+            //av_log(avctx, AV_LOG_DEBUG, "decoderThread: format has changed\n");
+            if(mediaBuffer) mediaBuffer->release();
+            freeFrame(frame, false);
+            continue;
+        default: {
+            //av_log(avctx, AV_LOG_DEBUG, "decoderThread: Decoder status unknown. Exiting\n");
+            if(mediaBuffer) mediaBuffer->release();
+            freeFrame(frame, false);
+            goto decoder_exit;
+        }
+        }
+    } while (!stagefrightContext->stopDecoderThread);
+decoder_exit:
+    //av_log(avctx, AV_LOG_DEBUG, "decoderThread: return 0\n");
+    stagefrightContext->decoderThreadExited = true;
     return 0;
 }
 
-static av_cold int Stagefright_init(AVCodecContext *avctx)
-{
-    StagefrightContext *s = (StagefrightContext*)avctx->priv_data;
-    sp<MetaData> meta, outFormat;
-    int32_t colorFormat = 0;
-    int ret;
+static AVPixelFormat findPixelFormat(int omxColorFormat) {
+    switch(omxColorFormat) {
+    case OMX_COLOR_FormatMonochrome:
+        return AV_PIX_FMT_MONOBLACK;
+    case OMX_COLOR_Format24bitRGB888:
+        return AV_PIX_FMT_RGB24;
+    case OMX_COLOR_Format24bitBGR888:
+        return AV_PIX_FMT_BGR24;
+    case OMX_COLOR_Format32bitBGRA8888:
+        return AV_PIX_FMT_BGRA;
+    case OMX_COLOR_Format32bitARGB8888:
+        return AV_PIX_FMT_ARGB;
+    case OMX_COLOR_FormatYUV411Planar:
+        return AV_PIX_FMT_YUV411P;
+    case OMX_COLOR_FormatYUV411PackedPlanar:
+        return AV_PIX_FMT_UYYVYY411;
+    case OMX_COLOR_FormatYUV420Planar:
+        return AV_PIX_FMT_YUV420P;
+    case OMX_QCOM_COLOR_FormatYVU420SemiPlanar:
+    case OMX_COLOR_FormatYUV420SemiPlanar:
+        //Not sure about the order of U and V
+        return AV_PIX_FMT_NV21;
+    case OMX_TI_COLOR_FormatYUV420PackedSemiPlanar:
+        return PIX_FMT_NV12;
+    case OMX_COLOR_FormatYUV422Planar:
+        return AV_PIX_FMT_YUV422P;
+    case OMX_COLOR_FormatYUV422PackedPlanar:
+        return AV_PIX_FMT_YUYV422;
+    case OMX_COLOR_FormatYUV422SemiPlanar:
+        return AV_PIX_FMT_NV16;
+    case OMX_COLOR_FormatYCbYCr:
+        return AV_PIX_FMT_YUYV422;
+    case OMX_COLOR_FormatCbYCrY:
+        return AV_PIX_FMT_UYVY422;
+    case OMX_COLOR_FormatL8:
+        return AV_PIX_FMT_GRAY8;
+    case OMX_COLOR_Format16bitARGB4444:
+        return AV_PIX_FMT_RGB444;
+    case OMX_COLOR_Format16bitARGB1555:
+        return AV_PIX_FMT_RGB555;
+    case OMX_COLOR_Format16bitRGB565:
+        return AV_PIX_FMT_RGB565;
+    case OMX_COLOR_Format16bitBGR565:
+        return AV_PIX_FMT_BGR565;
+    case OMX_COLOR_FormatL16:
+        return AV_PIX_FMT_GRAY16;
+    default:
+        return AV_PIX_FMT_NONE;
+    }
+}
 
-    if (!avctx->extradata || !avctx->extradata_size || avctx->extradata[0] != 1)
-        return -1;
+static int filter_packet(AVPacket *avPacket, AVCodecContext *avCodecContext, AVBitStreamFilterContext *avBitStreamFilterContext) {
+    int ret = 0;
 
-    s->avctx = avctx;
-    s->bsfc  = av_bitstream_filter_init("h264_mp4toannexb");
-    if (!s->bsfc) {
-        av_log(avctx, AV_LOG_ERROR, "Cannot open the h264_mp4toannexb BSF!\n");
-        return -1;
+    while (avBitStreamFilterContext) {
+        AVPacket maybeFiltereAvPacket = *avPacket;
+        ret = av_bitstream_filter_filter(avBitStreamFilterContext,
+                                         avCodecContext,
+                                         NULL,
+                                         &maybeFiltereAvPacket.data,
+                                         &maybeFiltereAvPacket.size,
+                                         avPacket->data,
+                                         avPacket->size,
+                                         avPacket->flags & AV_PKT_FLAG_KEY);
+
+        if (ret == 0 && maybeFiltereAvPacket.data != avPacket->data && maybeFiltereAvPacket.destruct) {
+            if ((ret = av_copy_packet(&maybeFiltereAvPacket, avPacket)) < 0) break;
+            ret = 1;
+        }
+
+        if (ret > 0) {
+            maybeFiltereAvPacket.buf = av_buffer_create(maybeFiltereAvPacket.data,
+                                                        maybeFiltereAvPacket.size,
+                                                        av_buffer_default_free,
+                                                        NULL,
+                                                        0);
+
+            if (!maybeFiltereAvPacket.buf) break;
+        }
+        *avPacket = maybeFiltereAvPacket;
+
+        avBitStreamFilterContext = avBitStreamFilterContext->next;
     }
 
-    s->orig_extradata_size = avctx->extradata_size;
-    s->orig_extradata = (uint8_t*) av_mallocz(avctx->extradata_size +
-                                              FF_INPUT_BUFFER_PADDING_SIZE);
-    if (!s->orig_extradata) {
-        ret = AVERROR(ENOMEM);
-        goto fail;
-    }
-    memcpy(s->orig_extradata, avctx->extradata, avctx->extradata_size);
-
-    meta = new MetaData;
-    if (meta == NULL) {
-        ret = AVERROR(ENOMEM);
-        goto fail;
-    }
-    meta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_VIDEO_AVC);
-    meta->setInt32(kKeyWidth, avctx->width);
-    meta->setInt32(kKeyHeight, avctx->height);
-    meta->setData(kKeyAVCC, kTypeAVCC, avctx->extradata, avctx->extradata_size);
-
-    android::ProcessState::self()->startThreadPool();
-
-    s->source    = new sp<MediaSource>();
-    *s->source   = new CustomSource(avctx, meta);
-    s->in_queue  = new List<Frame*>;
-    s->out_queue = new List<Frame*>;
-    s->ts_map    = new std::map<int64_t, TimeStamp>;
-    s->client    = new OMXClient;
-    s->end_frame = (Frame*)av_mallocz(sizeof(Frame));
-    if (s->source == NULL || !s->in_queue || !s->out_queue || !s->client ||
-        !s->ts_map || !s->end_frame) {
-        ret = AVERROR(ENOMEM);
-        goto fail;
+    if (ret < 0) {
+        av_log(avCodecContext,
+               AV_LOG_ERROR,
+               "Failed to filter bitstream with filter %s for stream %d with codec %s\n",
+               avBitStreamFilterContext->filter->name,
+               avPacket->stream_index,
+               avcodec_get_name(avCodecContext->codec_id));
     }
 
-    if (s->client->connect() !=  OK) {
-        av_log(avctx, AV_LOG_ERROR, "Cannot connect OMX client\n");
-        ret = -1;
-        goto fail;
-    }
-
-    s->decoder  = new sp<MediaSource>();
-    *s->decoder = OMXCodec::Create(s->client->interface(), meta,
-                                  false, *s->source, NULL,
-                                  OMXCodec::kClientNeedsFramebuffer);
-    if ((*s->decoder)->start() !=  OK) {
-        av_log(avctx, AV_LOG_ERROR, "Cannot start decoder\n");
-        ret = -1;
-        s->client->disconnect();
-        goto fail;
-    }
-
-    outFormat = (*s->decoder)->getFormat();
-    outFormat->findInt32(kKeyColorFormat, &colorFormat);
-    if (colorFormat == OMX_QCOM_COLOR_FormatYVU420SemiPlanar ||
-        colorFormat == OMX_COLOR_FormatYUV420SemiPlanar)
-        avctx->pix_fmt = AV_PIX_FMT_NV21;
-    else if (colorFormat == OMX_COLOR_FormatYCbYCr)
-        avctx->pix_fmt = AV_PIX_FMT_YUYV422;
-    else if (colorFormat == OMX_COLOR_FormatCbYCrY)
-        avctx->pix_fmt = AV_PIX_FMT_UYVY422;
-    else
-        avctx->pix_fmt = AV_PIX_FMT_YUV420P;
-
-    outFormat->findCString(kKeyDecoderComponent, &s->decoder_component);
-    if (s->decoder_component)
-        s->decoder_component = av_strdup(s->decoder_component);
-
-    pthread_mutex_init(&s->in_mutex, NULL);
-    pthread_mutex_init(&s->out_mutex, NULL);
-    pthread_cond_init(&s->condition, NULL);
-    return 0;
-
-fail:
-    av_bitstream_filter_close(s->bsfc);
-    av_freep(&s->orig_extradata);
-    av_freep(&s->end_frame);
-    delete s->in_queue;
-    delete s->out_queue;
-    delete s->ts_map;
-    delete s->client;
     return ret;
 }
 
-static int Stagefright_decode_frame(AVCodecContext *avctx, void *data,
-                                    int *got_frame, AVPacket *avpkt)
-{
-    StagefrightContext *s = (StagefrightContext*)avctx->priv_data;
+static int Stagefright_decode_frame(AVCodecContext *avctx, void *returnData, int *gotFrame, AVPacket *avPacket) {
+    StagefrightContext *stagefrightContext = (StagefrightContext*)avctx->priv_data;
     Frame *frame;
-    status_t status;
-    int orig_size = avpkt->size;
-    AVPacket pkt = *avpkt;
-    AVFrame *ret_frame;
+    int orig_size = avPacket->size;
+    AVFrame *returnFrame;
 
-    if (!s->thread_started) {
-        pthread_create(&s->decode_thread_id, NULL, &decode_thread, avctx);
-        s->thread_started = true;
-    }
+    if (stagefrightContext->decoderThreadExited) return ERROR_END_OF_STREAM;
 
-    if (avpkt && avpkt->data) {
-        av_bitstream_filter_filter(s->bsfc, avctx, NULL, &pkt.data, &pkt.size,
-                                   avpkt->data, avpkt->size, avpkt->flags & AV_PKT_FLAG_KEY);
-        avpkt = &pkt;
-    }
+    if (avPacket && avPacket->data) filter_packet(avPacket, avctx, stagefrightContext->mConverter);
 
-    if (!s->source_done) {
-        if(!s->dummy_buf) {
-            s->dummy_buf = (uint8_t*)av_malloc(avpkt->size);
-            if (!s->dummy_buf)
-                return AVERROR(ENOMEM);
-            s->dummy_bufsize = avpkt->size;
-            memcpy(s->dummy_buf, avpkt->data, avpkt->size);
+    if (!stagefrightContext->source_done) {
+        frame = allocFrame(avPacket->size);
+        if(frame == NULL) {
+            av_free_packet(avPacket);
+            return AVERROR(ENOMEM);
         }
 
-        frame = (Frame*)av_mallocz(sizeof(Frame));
-        if (avpkt->data) {
-            frame->status  = OK;
-            frame->size    = avpkt->size;
-            frame->key     = avpkt->flags & AV_PKT_FLAG_KEY ? 1 : 0;
-            frame->buffer  = (uint8_t*)av_malloc(avpkt->size);
-            if (!frame->buffer) {
-                av_freep(&frame);
-                return AVERROR(ENOMEM);
-            }
-            uint8_t *ptr = avpkt->data;
+        //av_log(avctx, AV_LOG_DEBUG, "Allocated frame of size\n");
+        if (avPacket->data) {
+            //av_log(avctx, AV_LOG_DEBUG, "Got data\n");
+            frame->isKeyFrame = avPacket->flags & AV_PKT_FLAG_KEY ? 1 : 0;
+            //av_log(avctx, AV_LOG_DEBUG, "Allocating frame buffer\n");
+            uint8_t *ptr = avPacket->data;
             // The OMX.SEC decoder fails without this.
-            if (avpkt->size == orig_size + avctx->extradata_size) {
+            if (avPacket->size == orig_size + avctx->extradata_size) {
                 ptr += avctx->extradata_size;
-                frame->size = orig_size;
+                frame->bufferSize = orig_size;
             }
             memcpy(frame->buffer, ptr, orig_size);
-            if (avpkt == &pkt)
-                av_free(avpkt->data);
 
-            frame->time = ++s->frame_index;
-            (*s->ts_map)[s->frame_index].pts = avpkt->pts;
-            (*s->ts_map)[s->frame_index].reordered_opaque = avctx->reordered_opaque;
+            frame->frameTime = ++stagefrightContext->currentFrameIndex;
+            (*stagefrightContext->frameIndexToTimestampMap)[stagefrightContext->currentFrameIndex].pts = avPacket->pts;
+            (*stagefrightContext->frameIndexToTimestampMap)[stagefrightContext->currentFrameIndex].reordered_opaque = avctx->reordered_opaque;
         } else {
-            frame->status  = ERROR_END_OF_STREAM;
-            s->source_done = true;
+            //av_log(avctx, AV_LOG_DEBUG, "Stagefright decode: End of stream\n");
+            stagefrightContext->source_done = true;
         }
 
         while (true) {
-            if (s->thread_exited) {
-                s->source_done = true;
+            if (stagefrightContext->decoderThreadExited) {
+                stagefrightContext->source_done = true;
                 break;
             }
-            pthread_mutex_lock(&s->in_mutex);
-            if (s->in_queue->size() >= 10) {
-                pthread_mutex_unlock(&s->in_mutex);
+            //av_log(avctx, AV_LOG_DEBUG, "Stagefright decode: locking input queue\n");
+            pthread_mutex_lock(&stagefrightContext->inputQueueMutex);
+            if (stagefrightContext->inputFrameQueue->size() >= 10) {
+                //av_log(avctx, AV_LOG_DEBUG, "Stagefright decode: input queue already contains max frames. Retryin insert in a bit\n");
+                pthread_mutex_unlock(&stagefrightContext->inputQueueMutex);
                 usleep(10000);
                 continue;
             }
-            s->in_queue->push_back(frame);
-            pthread_cond_signal(&s->condition);
-            pthread_mutex_unlock(&s->in_mutex);
+            //av_log(avctx, AV_LOG_DEBUG, "Stagefright decode: pushing frame to input queue\n");
+            stagefrightContext->inputFrameQueue->push_back(frame);
+            //av_log(avctx, AV_LOG_DEBUG, "Stagefright decode: broadcasting frameAvailableCondition\n");
+            pthread_cond_broadcast(&stagefrightContext->frameAvailableCondition);
+            //av_log(avctx, AV_LOG_DEBUG, "Stagefright decode: unlocking input queue\n");
+            pthread_mutex_unlock(&stagefrightContext->inputQueueMutex);
             break;
         }
     }
     while (true) {
-        pthread_mutex_lock(&s->out_mutex);
-        if (!s->out_queue->empty()) break;
-        pthread_mutex_unlock(&s->out_mutex);
-        if (s->source_done) {
+        if (stagefrightContext->decoderThreadExited) return ERROR_END_OF_STREAM;
+
+        //av_log(avctx, AV_LOG_DEBUG, "Stagefright decode: locking output queue\n");
+        pthread_mutex_lock(&stagefrightContext->outputQueueMutex);
+        if (!stagefrightContext->outputFrameQueue->empty()) break;
+        //av_log(avctx, AV_LOG_DEBUG, "Stagefright decode: unlocking empty output queue\n");
+        pthread_mutex_unlock(&stagefrightContext->outputQueueMutex);
+        if (stagefrightContext->source_done) {
             usleep(10000);
             continue;
         } else {
+            av_free_packet(avPacket);
             return orig_size;
         }
     }
 
-    frame = *s->out_queue->begin();
-    s->out_queue->erase(s->out_queue->begin());
-    pthread_mutex_unlock(&s->out_mutex);
+    frame = *(stagefrightContext->outputFrameQueue->begin());
+    //av_log(avctx, AV_LOG_DEBUG, "Stagefright decode: got decoded frame\n");
+    stagefrightContext->outputFrameQueue->erase(stagefrightContext->outputFrameQueue->begin());
+    //av_log(avctx, AV_LOG_DEBUG, "Stagefright decode: unlocking output queue\n");
+    pthread_mutex_unlock(&stagefrightContext->outputQueueMutex);
 
-    ret_frame = frame->vframe;
-    status  = frame->status;
-    av_freep(&frame);
+    returnFrame = frame->ffmpegFrame;
+    //av_log(avctx, AV_LOG_DEBUG, "Stagefright decode: frame->ffmpegFrame addr is %d\n", (int)(returnFrame));
+    *gotFrame = sizeof(AVFrame);
+    int err;
+    //returnFrame->extended_data = returnFrame->data;
 
-    if (status == ERROR_END_OF_STREAM)
-        return 0;
-    if (status != OK) {
-        if (status == AVERROR(ENOMEM))
-            return status;
-        av_log(avctx, AV_LOG_ERROR, "Decode failed: %x\n", status);
+    //av_log(avctx, AV_LOG_DEBUG, "ret_frame: format %d\n", returnFrame->format);
+    //av_log(avctx, AV_LOG_DEBUG, "ret_frame: %d x %d\n", returnFrame->width, returnFrame->height);
+    //av_log(avctx, AV_LOG_DEBUG, "ret_frame: channels %d\n", returnFrame->channels);
+    //av_log(avctx, AV_LOG_DEBUG, "ret_frame: channel_layout %d\n", returnFrame->channel_layout);
+    //av_log(avctx, AV_LOG_DEBUG, "ret_frame: nb_samples %d\n", returnFrame->nb_samples);
+
+    if ((err = av_frame_ref((AVFrame*)returnData, returnFrame)) < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Stagefright_decode_frame: av_frame_ref failed with %d\n", err);
+        freeFrame(frame, true);
+        av_free_packet(avPacket);
         return -1;
     }
 
-    if (s->prev_frame)
-        av_frame_free(&s->prev_frame);
-    s->prev_frame = ret_frame;
+    freeFrame(frame, false);
+    av_free_packet(avPacket);
 
-    *got_frame = 1;
-    *(AVFrame*)data = *ret_frame;
+    //av_log(avctx, AV_LOG_DEBUG, "Consumed %d\n", orig_size);
     return orig_size;
+}
+
+static void closeDecoderThread(AVCodecContext *avctx, StagefrightContext *stagefrightContext)
+{
+    Frame *frame;
+    stagefrightContext->stopReadThread = true;
+    if (stagefrightContext->decoderThreadStarted) {
+        //av_log(avctx, AV_LOG_DEBUG, "Stagefright close decoder started\n");
+        if (!stagefrightContext->decoderThreadExited) {
+            stagefrightContext->stopDecoderThread = 1;
+
+            // Make sure decode_thread() doesn't get stuck
+            pthread_mutex_lock(&stagefrightContext->inputQueueMutex);
+            pthread_cond_broadcast(&stagefrightContext->frameAvailableCondition);
+            pthread_mutex_unlock(&stagefrightContext->inputQueueMutex);
+
+            pthread_mutex_lock(&stagefrightContext->outputQueueMutex);
+            while (!stagefrightContext->outputFrameQueue->empty()) {
+                frame = *stagefrightContext->outputFrameQueue->begin();
+                stagefrightContext->outputFrameQueue->remove(frame);
+                av_log(NULL, AV_LOG_DEBUG, "Stagefrigh close decoder thread freeFrame\n");
+                freeFrame(frame, false);
+
+            }
+            pthread_mutex_unlock(&stagefrightContext->outputQueueMutex);
+
+            pthread_mutex_lock(&stagefrightContext->inputQueueMutex);
+            pthread_cond_broadcast(&stagefrightContext->frameAvailableCondition);
+            pthread_mutex_unlock(&stagefrightContext->inputQueueMutex);
+        }
+
+        //av_log(avctx, AV_LOG_DEBUG, "Stagefright close decoder waiting for decoder thread to finish\n");
+        pthread_join(stagefrightContext->decoderThreadId, NULL);
+        //av_log(avctx, AV_LOG_DEBUG, "Stagefright close decoder successful\n");
+        stagefrightContext->decoderThreadStarted = false;
+    }
+}
+
+static void closeOmxClient(StagefrightContext *stagefrightContext)
+{
+    stagefrightContext->decoder->stop();
+    stagefrightContext->decoder.clear();
+
+    if(stagefrightContext->isOmxConnected) {
+        stagefrightContext->omxClient->disconnect();
+        stagefrightContext->isOmxConnected = false;
+    }
+    if(stagefrightContext->omxClient != NULL) delete stagefrightContext->omxClient;
+}
+
+void closeQueues(StagefrightContext *stagefrightContext)
+{
+    Frame *frame;
+    if(stagefrightContext->inputFrameQueue != NULL) {
+        while (!stagefrightContext->inputFrameQueue->empty()) {
+            frame = *stagefrightContext->inputFrameQueue->begin();
+            stagefrightContext->inputFrameQueue->erase(stagefrightContext->inputFrameQueue->begin());
+            //av_log(NULL, AV_LOG_DEBUG, "closeQueues freeFrame\n");
+            freeFrame(frame, false);
+        }
+        delete stagefrightContext->inputFrameQueue;
+    }
+    if(stagefrightContext->outputFrameQueue != NULL) {
+        while (!stagefrightContext->outputFrameQueue->empty()) {
+            frame = *stagefrightContext->outputFrameQueue->begin();
+            stagefrightContext->outputFrameQueue->erase(stagefrightContext->outputFrameQueue->begin());
+            //av_log(NULL, AV_LOG_DEBUG, "closeQueues freeFrame\n");
+            freeFrame(frame, false);
+        }
+        delete stagefrightContext->outputFrameQueue;
+    }
+}
+
+static av_cold int Stagefright_init(AVCodecContext *avctx)
+{
+    StagefrightContext *stagefrightContext = (StagefrightContext*)avctx->priv_data;
+    stagefrightContext->frameExtraData = NULL;
+    stagefrightContext->mConverter = NULL;
+    stagefrightContext->mediaSource = NULL;
+    stagefrightContext->inputFrameQueue = NULL;
+    stagefrightContext->outputFrameQueue = NULL;
+    stagefrightContext->frameIndexToTimestampMap = NULL;
+    stagefrightContext->omxClient = NULL;
+    stagefrightContext->isOmxConnected = false;
+    stagefrightContext->decoderOutputFormat = NULL;
+    stagefrightContext->source_done = false;
+
+    sp<MetaData> metaData = NULL;
+    int colorFormat = 0;
+    int status;
+    int threadStarted;
+    AVPixelFormat pixelFormat = AV_PIX_FMT_NONE;
+
+    //av_log(avctx, AV_LOG_DEBUG, "Stagefright init\n");
+
+    if (!avctx->extradata || !avctx->extradata_size || avctx->extradata[0] != 1) {
+        av_log(avctx, AV_LOG_ERROR, "No extradata found\n");
+        return -1;
+    }
+
+    stagefrightContext->mVideo = avctx;
+    stagefrightContext->mConverter  = av_bitstream_filter_init("h264_mp4toannexb");
+    if (!stagefrightContext->mConverter) {
+        av_log(avctx, AV_LOG_ERROR, "Cannot open the h264_mp4toannexb BSF!\n");
+        return -1;
+    }
+
+    stagefrightContext->frameExtraDataSize = avctx->extradata_size;
+    stagefrightContext->frameExtraData = (uint8_t*) av_mallocz(avctx->extradata_size + FF_INPUT_BUFFER_PADDING_SIZE);
+    if (!stagefrightContext->frameExtraData) {
+        status = AVERROR(ENOMEM);
+        goto fail;
+    }
+    memcpy(stagefrightContext->frameExtraData, avctx->extradata, avctx->extradata_size);
+
+    metaData = new MetaData;
+    if (metaData == NULL) {
+        status = AVERROR(ENOMEM);
+        goto fail;
+    }
+    metaData->setCString(kKeyMIMEType, MEDIA_MIMETYPE_VIDEO_AVC);
+    metaData->setInt32(kKeyWidth, avctx->width);
+    metaData->setInt32(kKeyHeight, avctx->height);
+    metaData->setInt32(kKeyColorFormat, OMX_COLOR_FormatYUV420SemiPlanar);
+    if(avctx->extradata[0] == 1) metaData->setData(kKeyAVCC, kTypeAVCC, avctx->extradata, avctx->extradata_size);
+
+    android::ProcessState::self()->startThreadPool();
+
+    stagefrightContext->mediaSource      = new  CustomSource(avctx, metaData);
+    if(stagefrightContext->mediaSource == NULL) {
+        status = AVERROR(ENOMEM);
+        goto fail;
+    }
+    stagefrightContext->inputFrameQueue  = new std::list<Frame*>;
+    if(stagefrightContext->inputFrameQueue == NULL) {
+        status = AVERROR(ENOMEM);
+        goto fail;
+    }
+    stagefrightContext->outputFrameQueue = new std::list<Frame*>;
+    if(stagefrightContext->outputFrameQueue == NULL) {
+        status = AVERROR(ENOMEM);
+        goto fail;
+    }
+    stagefrightContext->frameIndexToTimestampMap    = new std::map<int64_t, TimeStamp>;
+    if(stagefrightContext->frameIndexToTimestampMap == NULL) {
+        status = AVERROR(ENOMEM);
+        goto fail;
+    }
+    stagefrightContext->omxClient    = new OMXClient;
+    if(stagefrightContext->omxClient == NULL) {
+        status = AVERROR(ENOMEM);
+        goto fail;
+    }
+
+    if (stagefrightContext->omxClient->connect() !=  OK) {
+        av_log(avctx, AV_LOG_ERROR, "Cannot connect OMX client\n");
+        status = -1;
+        goto fail;
+    } else stagefrightContext->isOmxConnected = true;
+
+    stagefrightContext->decoder = OMXCodec::Create(stagefrightContext->omxClient->interface(), metaData,
+                                                   false, stagefrightContext->mediaSource, NULL,
+                                                   OMXCodec::kClientNeedsFramebuffer);
+    if (stagefrightContext->decoder->start() !=  OK) {
+        av_log(avctx, AV_LOG_ERROR, "Cannot start decoder\n");
+        status = -1;
+        goto fail;
+    }
+
+    stagefrightContext->decoderOutputFormat = stagefrightContext->decoder->getFormat();
+    stagefrightContext->decoderOutputFormat->findInt32(kKeyColorFormat, &colorFormat);
+
+    pixelFormat = findPixelFormat(colorFormat);
+
+    if(pixelFormat == AV_PIX_FMT_NONE) {
+        av_log(avctx, AV_LOG_ERROR, "Decoder output format is unknown\n");
+        status = colorFormat;
+        goto fail;
+    }
+    avctx->pix_fmt = pixelFormat;
+
+    stagefrightContext->decoderOutputFormat->findCString(kKeyDecoderComponent, &stagefrightContext->decoderName);
+    if (stagefrightContext->decoderName) stagefrightContext->decoderName = av_strdup(stagefrightContext->decoderName);
+
+    pthread_mutex_init(&stagefrightContext->inputQueueMutex, NULL);
+    pthread_mutex_init(&stagefrightContext->outputQueueMutex, NULL);
+    pthread_cond_init(&stagefrightContext->frameAvailableCondition, NULL);
+
+    threadStarted = pthread_create(&stagefrightContext->decoderThreadId, NULL, &decoderThread, avctx);
+    if(threadStarted == 0) {
+        stagefrightContext->decoderThreadStarted = true;
+    } else {
+        stagefrightContext->decoderThreadStarted = false;
+        goto fail;
+    }
+
+    //av_log(avctx, AV_LOG_DEBUG, "Init successful\n");
+    return 0;
+fail:
+    av_log(avctx, AV_LOG_ERROR, "Failed with status %d\n", status);
+
+    closeDecoderThread(avctx, stagefrightContext);
+    closeOmxClient(stagefrightContext);
+    closeQueues(stagefrightContext);
+
+    if (stagefrightContext->mConverter != NULL) {
+        av_bitstream_filter_close(stagefrightContext->mConverter);
+        stagefrightContext->mConverter = NULL;
+    }
+    //if (stagefrightContext->frameExtraData != NULL) av_freep(&stagefrightContext->frameExtraData);
+    if (stagefrightContext->frameIndexToTimestampMap != NULL) {
+        delete stagefrightContext->frameIndexToTimestampMap;
+        stagefrightContext->frameIndexToTimestampMap = NULL;
+    }
+    if (stagefrightContext->decoderName) av_freep(&stagefrightContext->decoderName);
+
+    pthread_mutex_destroy(&stagefrightContext->inputQueueMutex);
+    pthread_mutex_destroy(&stagefrightContext->outputQueueMutex);
+    pthread_cond_destroy(&stagefrightContext->frameAvailableCondition);
+
+    return status;
 }
 
 static av_cold int Stagefright_close(AVCodecContext *avctx)
 {
-    StagefrightContext *s = (StagefrightContext*)avctx->priv_data;
+    StagefrightContext *stagefrightContext = (StagefrightContext*)avctx->priv_data;
     Frame *frame;
 
-    if (s->thread_started) {
-        if (!s->thread_exited) {
-            s->stop_decode = 1;
+    //av_log(avctx, AV_LOG_DEBUG, "Stagefright close initiated\n");
 
-            // Make sure decode_thread() doesn't get stuck
-            pthread_mutex_lock(&s->out_mutex);
-            while (!s->out_queue->empty()) {
-                frame = *s->out_queue->begin();
-                s->out_queue->erase(s->out_queue->begin());
-                if (frame->vframe)
-                    av_frame_free(&frame->vframe);
-                av_freep(&frame);
-            }
-            pthread_mutex_unlock(&s->out_mutex);
-
-            // Feed a dummy frame prior to signalling EOF.
-            // This is required to terminate the decoder(OMX.SEC)
-            // when only one frame is read during stream info detection.
-            if (s->dummy_buf && (frame = (Frame*)av_mallocz(sizeof(Frame)))) {
-                frame->status = OK;
-                frame->size   = s->dummy_bufsize;
-                frame->key    = 1;
-                frame->buffer = s->dummy_buf;
-                pthread_mutex_lock(&s->in_mutex);
-                s->in_queue->push_back(frame);
-                pthread_cond_signal(&s->condition);
-                pthread_mutex_unlock(&s->in_mutex);
-                s->dummy_buf = NULL;
-            }
-
-            pthread_mutex_lock(&s->in_mutex);
-            s->end_frame->status = ERROR_END_OF_STREAM;
-            s->in_queue->push_back(s->end_frame);
-            pthread_cond_signal(&s->condition);
-            pthread_mutex_unlock(&s->in_mutex);
-            s->end_frame = NULL;
-        }
-
-        pthread_join(s->decode_thread_id, NULL);
-
-        if (s->prev_frame)
-            av_frame_free(&s->prev_frame);
-
-        s->thread_started = false;
-    }
-
-    while (!s->in_queue->empty()) {
-        frame = *s->in_queue->begin();
-        s->in_queue->erase(s->in_queue->begin());
-        if (frame->size)
-            av_freep(&frame->buffer);
-        av_freep(&frame);
-    }
-
-    while (!s->out_queue->empty()) {
-        frame = *s->out_queue->begin();
-        s->out_queue->erase(s->out_queue->begin());
-        if (frame->vframe)
-            av_frame_free(&frame->vframe);
-        av_freep(&frame);
-    }
-
-    (*s->decoder)->stop();
-    s->client->disconnect();
-
-    if (s->decoder_component)
-        av_freep(&s->decoder_component);
-    av_freep(&s->dummy_buf);
-    av_freep(&s->end_frame);
+    closeDecoderThread(avctx, stagefrightContext);
+    closeOmxClient(stagefrightContext);
+    closeQueues(stagefrightContext);
 
     // Reset the extradata back to the original mp4 format, so that
     // the next invocation (both when decoding and when called from
     // av_find_stream_info) get the original mp4 format extradata.
     av_freep(&avctx->extradata);
-    avctx->extradata = s->orig_extradata;
-    avctx->extradata_size = s->orig_extradata_size;
+    avctx->extradata = stagefrightContext->frameExtraData;
+    avctx->extradata_size = stagefrightContext->frameExtraDataSize;
 
-    delete s->in_queue;
-    delete s->out_queue;
-    delete s->ts_map;
-    delete s->client;
-    delete s->decoder;
-    delete s->source;
+    if (stagefrightContext->mConverter != NULL) {
+        av_bitstream_filter_close(stagefrightContext->mConverter);
+        stagefrightContext->mConverter = NULL;
+    }
+    //if (stagefrightContext->frameExtraData != NULL) av_freep(&stagefrightContext->frameExtraData);
+    if (stagefrightContext->frameIndexToTimestampMap != NULL) {
+        delete stagefrightContext->frameIndexToTimestampMap;
+        stagefrightContext->frameIndexToTimestampMap = NULL;
+    }
+    if (stagefrightContext->decoderName) av_freep(&stagefrightContext->decoderName);
 
-    pthread_mutex_destroy(&s->in_mutex);
-    pthread_mutex_destroy(&s->out_mutex);
-    pthread_cond_destroy(&s->condition);
-    av_bitstream_filter_close(s->bsfc);
+    pthread_mutex_destroy(&stagefrightContext->inputQueueMutex);
+    pthread_mutex_destroy(&stagefrightContext->outputQueueMutex);
+    pthread_cond_destroy(&stagefrightContext->frameAvailableCondition);
     return 0;
 }
 
