@@ -2606,7 +2606,7 @@ static int open_files(OptionGroupList *l, const char *inout,
             return ret;
         }
 
-        av_log(NULL, AV_LOG_DEBUG, "Opening an %s file: %s.\n", inout, g->arg);
+        av_log(NULL, AV_LOG_INFO, "Opening an %s file: %s.\n", inout, g->arg);
         ret = open_file(&o, g->arg);
         uninit_options(&o);
         if (ret < 0) {

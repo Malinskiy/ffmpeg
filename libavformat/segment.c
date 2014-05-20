@@ -291,6 +291,12 @@ static void segment_list_print_entry(AVIOContext      *list_ioctx,
     }
 }
 
+static void segment_list_notify_entry(const SegmentListEntry *list_entry,
+                                     void *log_ctx)
+{
+    av_log(log_ctx, AV_LOG_INFO, "Segment file is ready: %s\n", list_entry->filename);
+}
+
 static int segment_end(AVFormatContext *s, int write_trailer, int is_last)
 {
     SegmentContext *seg = s->priv_data;
@@ -332,8 +338,12 @@ static int segment_end(AVFormatContext *s, int write_trailer, int is_last)
             avio_close(seg->list_pb);
             if ((ret = segment_list_open(s)) < 0)
                 goto end;
-            for (entry = seg->segment_list_entries; entry; entry = entry->next)
+            for (entry = seg->segment_list_entries; entry; entry = entry->next) {
                 segment_list_print_entry(seg->list_pb, seg->list_type, entry, s);
+                if(!(entry->next)) {
+                    segment_list_notify_entry(entry, s);
+                }
+            }
             if (seg->list_type == LIST_TYPE_M3U8 && is_last)
                 avio_printf(seg->list_pb, "#EXT-X-ENDLIST\n");
         } else {
